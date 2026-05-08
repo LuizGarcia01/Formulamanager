@@ -4,9 +4,15 @@ import type { Track, Car, Driver, CompoundProfile } from './types.js';
 // PERFIS DE PNEU (Pirelli 2026 — números aproximados pra balanceamento)
 // =====================================================================
 export const COMPOUND_PROFILES: Record<string, CompoundProfile> = {
-  soft:   { compound: 'soft',   paceOffset: -0.65, degPerLap: 0.045, cliffLap: 18 },
-  medium: { compound: 'medium', paceOffset:  0.00, degPerLap: 0.022, cliffLap: 28 },
-  hard:   { compound: 'hard',   paceOffset:  0.45, degPerLap: 0.014, cliffLap: 40 },
+  soft:         { compound: 'soft',         paceOffset: -0.65, degPerLap: 0.045, cliffLap: 18 },
+  medium:       { compound: 'medium',       paceOffset:  0.00, degPerLap: 0.022, cliffLap: 28 },
+  hard:         { compound: 'hard',         paceOffset:  0.45, degPerLap: 0.014, cliffLap: 40 },
+  // Pneus de chuva têm paceOffset GRANDE em pista seca (lentos),
+  // mas viram os mais rápidos quando wetness sobe.
+  // Inter: ideal entre 0.3-0.7 de wetness
+  intermediate: { compound: 'intermediate', paceOffset:  4.50, degPerLap: 0.030, cliffLap: 25 },
+  // Wet: ideal acima de 0.7 de wetness
+  wet:          { compound: 'wet',          paceOffset:  7.00, degPerLap: 0.020, cliffLap: 35 },
 };
 
 // =====================================================================

@@ -1,6 +1,7 @@
 import type {
   Track, Sector, Car, Driver, RaceConfig, RaceResult, RaceEntry,
   CarRaceState, CompoundProfile, EnergyMode, LapLogEntry, TireState,
+  WeatherForecast, WeatherState, RaceFlagState, Compound, ReactiveStrategy,
 } from './types.js';
 import { COMPOUND_PROFILES } from './data.js';
 import { RNG } from './rng.js';
@@ -8,21 +9,35 @@ import { RNG } from './rng.js';
 // =====================================================================
 // CONSTANTES DE BALANCEAMENTO
 // =====================================================================
-// Estes números ficam aqui em vez de mágicos no código pra facilitar tuning.
 
-const PERF_SCALE_PER_POINT = 0.0015; // cada ponto de performance = 0.15% do tempo do setor
-const DRIVER_SCALE_PER_POINT = 0.0008; // cada ponto de pace do piloto = 0.08% do tempo
-const FUEL_SECONDS_PER_KG = 0.030;   // ~0.03s por kg de combustível
-const FUEL_BURN_PER_LAP = 1.6;        // kg consumidos por volta (aprox 100kg/63voltas)
-const STARTING_FUEL = 110;             // kg de partida
+const PERF_SCALE_PER_POINT = 0.0015;
+const DRIVER_SCALE_PER_POINT = 0.0008;
+const FUEL_SECONDS_PER_KG = 0.030;
+const FUEL_BURN_PER_LAP = 1.6;
+const STARTING_FUEL = 110;
 
-// Energia 2026:
-const MAX_HARVEST_PER_LAP = 8.5;     // MJ regulamentar
-const MAX_DEPLOY_PER_LAP = 8.5;      // MJ regulamentar
-const OVERTAKE_BONUS_MJ = 0.5;       // MJ extra quando ativo
+const MAX_HARVEST_PER_LAP = 8.5;
+const MAX_DEPLOY_PER_LAP = 8.5;
+const OVERTAKE_BONUS_MJ = 0.5;
 
-// Variabilidade de pace (gaussiana). Sigma escalado por consistência do piloto.
-const BASE_PACE_SIGMA_PCT = 0.0025;  // 0.25% do tempo do setor
+const BASE_PACE_SIGMA_PCT = 0.0025;
+
+// Eventos / falhas
+// Probabilidade BASE por volta de uma falha mecânica (modulada por reliability):
+const BASE_MECHANICAL_FAILURE_PROB = 0.0015;
+// Probabilidade BASE por volta de erro de piloto (spin/escapada):
+const BASE_DRIVER_ERROR_PROB = 0.0010;
+// Probabilidade base de incidente entre carros próximos disputando ultrapassagem:
+const COLLISION_RISK_BASE = 0.015;
+
+// Safety Car
+const SC_DURATION_LAPS = 4;          // SC fica em pista 4 voltas
+const SC_LAP_TIME_MULTIPLIER = 1.40; // sob SC, voltas 40% mais lentas
+const VSC_LAP_TIME_MULTIPLIER = 1.30;
+const SC_PIT_LANE_DISCOUNT = 0.55;   // pit sob SC custa 55% do normal (carros estão lentos)
+
+// Chuva: penalidade de pace por nível de wetness em pneu errado
+const WET_PACE_PENALTY_PER_LEVEL = 8.0; // segundos por volta com pneu seco em pista 100% molhada
 
 // =====================================================================
 // CÁLCULO DE PACE DE SETOR
@@ -37,16 +52,16 @@ interface SectorContext {
   car: Car;
   driver: Driver;
   state: CarRaceState;
-  trafficPenalty: number;     // segundos perdidos por estar em ar sujo
-  energyDeployedMJ: number;   // MJ deployados neste setor (0 a algo razoável)
+  trafficPenalty: number;
+  energyDeployedMJ: number;
+  weather: WeatherState;
   rng: RNG;
 }
 
 function calculateSectorTime(ctx: SectorContext): number {
-  const { sector, car, driver, state, trafficPenalty, energyDeployedMJ, rng } = ctx;
+  const { sector, car, driver, state, trafficPenalty, energyDeployedMJ, weather, rng } = ctx;
 
   // 1) Performance do carro ponderada pelos pesos do setor.
-  //    Faz "média ponderada" das características relevantes pra este setor.
   const carScore =
     car.performance.aero * sector.aeroWeight +
     ((car.performance.powerICE + car.performance.powerBattery) / 2) * sector.powerWeight +
@@ -67,16 +82,57 @@ function calculateSectorTime(ctx: SectorContext): number {
   // 5) Energia: deploy ganha tempo, scaled pelo benefit do setor.
   const energyGain = energyDeployedMJ * sector.deployBenefit;
 
-  // 6) Tempo base × deficits multiplicativos
+  // 6) Clima: penalidade por pneu errado pro nível de molhado da pista.
+  const weatherPenalty = computeWeatherPenalty(state.tire, weather, driver, sector);
+
+  // 7) Tempo base × deficits multiplicativos
   const baseWithDeficits = sector.baseTime * (1 + carDeficit) * (1 + driverDeficit);
 
-  // 7) Variabilidade gaussiana, escalada por consistência do piloto.
+  // 8) Variabilidade gaussiana, escalada por consistência do piloto.
   //    Piloto 95 de consistência = ~50% da variação base. Piloto 70 = 150%.
+  //    Em chuva, variabilidade aumenta — mas atenuada por wetSkill do piloto.
   const consistencyFactor = (130 - driver.attributes.consistency) / 60;
-  const sigma = sector.baseTime * BASE_PACE_SIGMA_PCT * consistencyFactor;
+  const wetnessNoiseMultiplier = 1 + (weather.wetness * (1 - driver.attributes.wetSkill / 100) * 2);
+  const sigma = sector.baseTime * BASE_PACE_SIGMA_PCT * consistencyFactor * wetnessNoiseMultiplier;
   const noise = rng.gaussian(0, sigma);
 
-  return baseWithDeficits + tireOffset + fuelOffset - energyGain + trafficPenalty + noise;
+  return baseWithDeficits + tireOffset + fuelOffset - energyGain + weatherPenalty + trafficPenalty + noise;
+}
+
+// =====================================================================
+// PENALIDADE DE CLIMA POR PNEU
+// =====================================================================
+// Cada composto tem uma "janela ideal" de wetness:
+// - Slicks (soft/medium/hard): ideais em wetness 0
+// - Intermediate: ideal em wetness ~0.5
+// - Wet: ideal em wetness ~0.85
+// Fora da janela, perde tempo proporcional ao desvio.
+function computeWeatherPenalty(
+  tire: TireState,
+  weather: WeatherState,
+  driver: Driver,
+  sector: Sector,
+): number {
+  const sectorFraction = sector.baseTime / 76.5;
+  const w = weather.wetness;
+  let optimalWetness = 0;
+  let toleranceWindow = 0.15;  // quão longe da janela ideal sem perder muito
+
+  switch (tire.compound) {
+    case 'soft': case 'medium': case 'hard':
+      optimalWetness = 0; toleranceWindow = 0.15; break;
+    case 'intermediate':
+      optimalWetness = 0.5; toleranceWindow = 0.25; break;
+    case 'wet':
+      optimalWetness = 0.85; toleranceWindow = 0.20; break;
+  }
+
+  const deviation = Math.max(0, Math.abs(w - optimalWetness) - toleranceWindow);
+  // Penalidade exponencial em pneu MUITO errado (slick em chuva forte = catástrofe)
+  const penalty = Math.pow(deviation * 2, 2) * WET_PACE_PENALTY_PER_LEVEL * sectorFraction;
+  // Skill em chuva reduz a penalidade (até 30%):
+  const wetSkillReduction = (driver.attributes.wetSkill / 100) * 0.3;
+  return penalty * (1 - wetSkillReduction);
 }
 
 // Pneu: paceOffset é "linear scaled" pra setor, depois soma degradação acumulada.
@@ -119,16 +175,32 @@ export function simulateRace(config: RaceConfig): RaceResult {
     lastSectorTimes: null,
   }));
 
-  // Largada: penalidade de "primeira volta" pequena, ordem mantida (sem pit stop ainda)
   applyStartPenalty(states, config.entries, rng);
+
+  // Estado do clima (atualizado a cada volta a partir do forecast)
+  const weatherState: WeatherState = { wetness: 0, rainIntensity: 0 };
+  // Estado da bandeira/flag
+  const flagState: RaceFlagState = { flag: 'green', flagEndsAtLap: null, reason: null };
+  // Pit stops já realizados (pra estratégias reativas não pararem 5x):
+  const pitsTaken = new Map<string, number>(states.map(s => [s.driverId, 0]));
 
   const lapLog: LapLogEntry[] = [];
 
   for (let lap = 1; lap <= config.track.laps; lap++) {
-    simulateLap(lap, config, states, rng, lapLog);
+    // 1. Atualiza clima
+    updateWeather(weatherState, config.weather, lap, rng);
+
+    // 2. Atualiza flag (encerra SC/VSC se for hora)
+    if (flagState.flagEndsAtLap !== null && lap > flagState.flagEndsAtLap) {
+      lapLog.push({ lap, standings: [], events: [`L${lap}: Bandeira verde — ${flagState.flag === 'safetyCar' ? 'SC' : 'VSC'} encerrado`] });
+      flagState.flag = 'green';
+      flagState.flagEndsAtLap = null;
+      flagState.reason = null;
+    }
+
+    simulateLap(lap, config, states, weatherState, flagState, pitsTaken, rng, lapLog);
   }
 
-  // Ordenação final: não-retirados pelo tempo total, retirados no fim por voltas completadas.
   const finishOrder = [...states].sort((a, b) => {
     if (a.retired && !b.retired) return 1;
     if (!a.retired && b.retired) return -1;
@@ -137,6 +209,49 @@ export function simulateRace(config: RaceConfig): RaceResult {
   });
 
   return { finishOrder, lapLog, totalLaps: config.track.laps };
+}
+
+// =====================================================================
+// CLIMA — interpola entre os pontos do forecast
+// =====================================================================
+function updateWeather(state: WeatherState, forecast: WeatherForecast | undefined, lap: number, rng: RNG): void {
+  if (!forecast || forecast.changes.length === 0) {
+    state.wetness = 0;
+    state.rainIntensity = 0;
+    return;
+  }
+
+  // Encontra os dois pontos do forecast em volta da volta atual
+  const sorted = [...forecast.changes].sort((a, b) => a.lap - b.lap);
+  let before = sorted[0]!;
+  let after = sorted[sorted.length - 1]!;
+  for (let i = 0; i < sorted.length - 1; i++) {
+    if (sorted[i]!.lap <= lap && sorted[i + 1]!.lap >= lap) {
+      before = sorted[i]!;
+      after = sorted[i + 1]!;
+      break;
+    }
+  }
+
+  if (lap <= before.lap) {
+    state.wetness = before.wetness;
+  } else if (lap >= after.lap) {
+    state.wetness = after.wetness;
+  } else {
+    // Interpolação linear
+    const span = after.lap - before.lap;
+    const t = (lap - before.lap) / span;
+    state.wetness = before.wetness + (after.wetness - before.wetness) * t;
+  }
+
+  // Adiciona ruído pela incerteza (chuva chega antes/depois do esperado)
+  if (forecast.uncertainty > 0) {
+    const noise = rng.gaussian(0, forecast.uncertainty * 0.15);
+    state.wetness = Math.max(0, Math.min(1, state.wetness + noise));
+  }
+
+  // rainIntensity = derivada (quão rápido tá molhando agora)
+  state.rainIntensity = state.wetness;
 }
 
 function applyStartPenalty(states: CarRaceState[], entries: RaceEntry[], rng: RNG): void {
@@ -159,37 +274,39 @@ function simulateLap(
   lap: number,
   config: RaceConfig,
   states: CarRaceState[],
+  weather: WeatherState,
+  flag: RaceFlagState,
+  pitsTaken: Map<string, number>,
   rng: RNG,
   lapLog: LapLogEntry[],
 ): void {
   const events: string[] = [];
 
-  // Snapshot da ordem e tempos NO INÍCIO da volta. Crítico: usamos estes
-  // valores pra calcular tráfego, ar sujo, ultrapassagem. Sem isso, quando o
-  // primeiro carro processa e atualiza totalTime, o segundo carro vê um gap
-  // gigante e calcula penalidade absurda. Bug original.
+  // Snapshot da ordem no INÍCIO da volta (pra cálculos consistentes).
   const startOfLapOrder = [...states]
     .filter(s => !s.retired)
     .sort((a, b) => a.totalTime - b.totalTime);
   const snapshotTimes = new Map(startOfLapOrder.map(s => [s.driverId, s.totalTime]));
 
+  // Se há SC/VSC ativo, multiplicador de tempo
+  const flagMultiplier = flag.flag === 'safetyCar' ? SC_LAP_TIME_MULTIPLIER
+    : flag.flag === 'vsc' ? VSC_LAP_TIME_MULTIPLIER
+    : 1.0;
+
   for (let i = 0; i < startOfLapOrder.length; i++) {
     const state = startOfLapOrder[i]!;
     const entry = config.entries.find(e => e.driver.id === state.driverId)!;
 
-    // -- Gap pra carro à frente, USANDO SNAPSHOT (não totalTime atual)
+    // -- Gap pra carro à frente
     const aheadSnapshot = i > 0 ? snapshotTimes.get(startOfLapOrder[i - 1]!.driverId)! : null;
     const ownSnapshot = snapshotTimes.get(state.driverId)!;
     const gapAhead = aheadSnapshot !== null ? ownSnapshot - aheadSnapshot : Infinity;
 
-    // -- ENERGIA: Overtake mode (se a <1s do carro à frente no início da volta)
     state.energy.overtakeAvailable = gapAhead < 1.0 && gapAhead >= 0;
 
-    // -- ENERGIA: planeja deploy desta volta segundo modo
     const deployBudgetThisLap = planEnergyDeploy(state, entry.car);
     const sectorDeploys = distributeDeployAcrossSectors(deployBudgetThisLap, config.track.sectors);
 
-    // -- TRÁFEGO: penalidade se há carro na frente a <1.0s (ar sujo)
     let trafficPenaltyTotal = 0;
     if (gapAhead >= 0 && gapAhead < 1.0) {
       trafficPenaltyTotal = (1.0 - gapAhead) * 0.4;
@@ -198,7 +315,7 @@ function simulateLap(
     }
     const trafficPerSector = trafficPenaltyTotal / 3;
 
-    // -- SIMULA OS 3 SETORES
+    // SIMULA OS 3 SETORES
     const sectorTimes: [number, number, number] = [0, 0, 0];
     let lapTime = 0;
     let totalHarvested = 0;
@@ -213,6 +330,7 @@ function simulateLap(
         state,
         trafficPenalty: trafficPerSector,
         energyDeployedMJ: sectorDeploys[sIdx]!,
+        weather,
         rng,
       };
       const t = calculateSectorTime(ctx);
@@ -223,7 +341,13 @@ function simulateLap(
       totalHarvested += harvestThisSector;
     }
 
-    // -- ATUALIZA ESTADO DO CARRO
+    // Aplica multiplicador de SC/VSC
+    lapTime *= flagMultiplier;
+    sectorTimes[0] *= flagMultiplier;
+    sectorTimes[1] *= flagMultiplier;
+    sectorTimes[2] *= flagMultiplier;
+
+    // ATUALIZA ESTADO
     state.totalTime += lapTime;
     state.lapsCompleted = lap;
     state.tire.laps += 1;
@@ -237,24 +361,76 @@ function simulateLap(
       state.energy.battery - totalDeployed + totalHarvested,
     ));
 
-    // -- PIT STOP no final desta volta?
-    const pitStop = entry.pitStops.find(p => p.lap === lap);
-    if (pitStop) {
-      state.totalTime += config.track.pitLaneLossSeconds;
-      state.tire = { compound: pitStop.newCompound, laps: 0 };
-      if (pitStop.newEnergyMode) state.energy.mode = pitStop.newEnergyMode;
-      events.push(`L${lap}: ${entry.driver.name} parou nos boxes — ${pitStop.newCompound.toUpperCase()}`);
+    // -- EVENTOS: falha mecânica?
+    if (flag.flag === 'green') {  // não checa eventos sob bandeira
+      const reliabilityFactor = (100 - entry.car.performance.reliability) / 100;
+      const failureProb = BASE_MECHANICAL_FAILURE_PROB * (0.3 + reliabilityFactor * 2);
+      if (rng.chance(failureProb)) {
+        state.retired = true;
+        const causes = ['motor', 'transmissão', 'suspensão', 'eletrônica', 'hidráulica', 'bateria'];
+        const cause = causes[Math.floor(rng.next() * causes.length)]!;
+        state.retirementReason = cause;
+        events.push(`💥 L${lap}: ${entry.driver.name} ABANDONA — falha de ${cause}`);
+        // Falha mecânica tem chance de gerar SC (debris, óleo)
+        if (rng.chance(0.30) && flag.flag === 'green') {
+          flag.flag = 'vsc';
+          flag.flagEndsAtLap = lap + 2;
+          flag.reason = `Carro parado: ${entry.driver.name}`;
+          events.push(`🚨 L${lap}: VSC — ${flag.reason}`);
+        }
+        continue;
+      }
+
+      // Erro de piloto: spin / escapada (não retira, mas perde tempo)
+      // Probabilidade aumenta com baixa consistência e em chuva
+      const consistencyFactor = (100 - entry.driver.attributes.consistency) / 100;
+      const wetFactor = weather.wetness * (1 - entry.driver.attributes.wetSkill / 100);
+      const errorProb = BASE_DRIVER_ERROR_PROB * (1 + consistencyFactor * 3 + wetFactor * 4);
+      if (rng.chance(errorProb)) {
+        const lostTime = 3 + rng.next() * 8; // 3-11s perdidos
+        state.totalTime += lostTime;
+        events.push(`⚠️  L${lap}: ${entry.driver.name} comete erro — perde ${lostTime.toFixed(1)}s`);
+      }
     }
 
-    // -- ULTRAPASSAGEM: usa snapshot pra detectar proximidade
-    if (i > 0 && gapAhead >= 0 && gapAhead < 1.0) {
+    // -- ESTRATÉGIA REATIVA: pit não planejado?
+    const reactivePit = decideReactivePit(state, entry, weather, flag, pitsTaken.get(state.driverId) ?? 0);
+    if (reactivePit) {
+      const pitCost = config.track.pitLaneLossSeconds *
+        (flag.flag === 'safetyCar' || flag.flag === 'vsc' ? SC_PIT_LANE_DISCOUNT : 1);
+      state.totalTime += pitCost;
+      state.tire = { compound: reactivePit, laps: 0 };
+      pitsTaken.set(state.driverId, (pitsTaken.get(state.driverId) ?? 0) + 1);
+      events.push(`🔧 L${lap}: ${entry.driver.name} pit reativo → ${reactivePit.toUpperCase()}`);
+    } else {
+      // PIT STOP planejado
+      const pitStop = entry.pitStops.find(p => p.lap === lap);
+      if (pitStop) {
+        const pitCost = config.track.pitLaneLossSeconds *
+          (flag.flag === 'safetyCar' || flag.flag === 'vsc' ? SC_PIT_LANE_DISCOUNT : 1);
+        state.totalTime += pitCost;
+        state.tire = { compound: pitStop.newCompound, laps: 0 };
+        if (pitStop.newEnergyMode) state.energy.mode = pitStop.newEnergyMode;
+        pitsTaken.set(state.driverId, (pitsTaken.get(state.driverId) ?? 0) + 1);
+        events.push(`L${lap}: ${entry.driver.name} parou nos boxes — ${pitStop.newCompound.toUpperCase()}`);
+      }
+    }
+
+    // -- ULTRAPASSAGEM: só sob bandeira verde
+    if (flag.flag === 'green' && i > 0 && gapAhead >= 0 && gapAhead < 1.0) {
       const ahead = startOfLapOrder[i - 1]!;
+      if (ahead.retired) continue;
       const aheadEntry = config.entries.find(e => e.driver.id === ahead.driverId)!;
       const passResult = tryOvertake(state, entry, ahead, aheadEntry, config.track, rng);
       if (passResult.passed) {
-        // Atacante sai 0.15s à frente do defensor (já com tempo da volta aplicado)
         state.totalTime = ahead.totalTime - 0.15;
         events.push(`L${lap}: ${entry.driver.name} ultrapassa ${aheadEntry.driver.name}`);
+        // Risco de colisão durante tentativa intensa
+        if (rng.chance(COLLISION_RISK_BASE * (1 - entry.driver.attributes.racecraft / 100))) {
+          state.totalTime += 4;
+          ahead.totalTime += 6;
+          events.push(`💢 L${lap}: contato leve entre ${entry.driver.name} e ${aheadEntry.driver.name}`);
+        }
       } else if (passResult.attempted) {
         events.push(`L${lap}: ${entry.driver.name} tenta passar ${aheadEntry.driver.name} — defendido`);
       }
@@ -286,6 +462,47 @@ function simulateLap(
     events,
   };
   lapLog.push(lapEntry);
+}
+
+// =====================================================================
+// ESTRATÉGIA REATIVA: decide trocar pneu fora do plano
+// =====================================================================
+function decideReactivePit(
+  state: CarRaceState,
+  entry: RaceEntry,
+  weather: WeatherState,
+  flag: RaceFlagState,
+  alreadyPitted: number,
+): Compound | null {
+  const strategy = entry.reactiveStrategy;
+  if (!strategy) return null;
+
+  const tire = state.tire.compound;
+  const w = weather.wetness;
+  const isSlick = tire === 'soft' || tire === 'medium' || tire === 'hard';
+  const isInter = tire === 'intermediate';
+  const isWet = tire === 'wet';
+
+  // Pista molhando: troca pra inter ou wet
+  if (isSlick && strategy.pitToWetIfWetnessAbove !== undefined && w >= strategy.pitToWetIfWetnessAbove) {
+    return 'wet';
+  }
+  if (isSlick && strategy.pitToIntermediateIfWetnessAbove !== undefined && w >= strategy.pitToIntermediateIfWetnessAbove) {
+    return 'intermediate';
+  }
+  if (isInter && strategy.pitToWetIfWetnessAbove !== undefined && w >= strategy.pitToWetIfWetnessAbove) {
+    return 'wet';
+  }
+
+  // Pista secando: troca pra slick
+  if ((isInter || isWet) && strategy.pitToDryIfWetnessBelow !== undefined && w <= strategy.pitToDryIfWetnessBelow) {
+    return 'medium';
+  }
+  if (isWet && strategy.pitToIntermediateIfWetnessAbove !== undefined && w < strategy.pitToIntermediateIfWetnessAbove) {
+    return 'intermediate';
+  }
+
+  return null;
 }
 
 // =====================================================================

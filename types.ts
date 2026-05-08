@@ -68,7 +68,10 @@ export interface Driver {
 }
 
 // --------- PNEU ---------
-export type Compound = 'soft' | 'medium' | 'hard';
+export type Compound = 'soft' | 'medium' | 'hard' | 'intermediate' | 'wet';
+
+export type DryCompound = 'soft' | 'medium' | 'hard';
+export type WetCompound = 'intermediate' | 'wet';
 
 export interface CompoundProfile {
   compound: Compound;
@@ -123,6 +126,37 @@ export interface RaceConfig {
   track: Track;
   entries: RaceEntry[];        // grid de largada (na ordem)
   seed: number;                // pra reproduzibilidade
+  weather?: WeatherForecast;   // se omitido, corrida seca o tempo todo
+}
+
+// --------- CLIMA ---------
+// 0 = pista totalmente seca, 1 = pista totalmente encharcada
+// Valor parcial (0.3 = umidade leve, 0.6 = molhada, 0.9 = muito molhada)
+export interface WeatherForecast {
+  // Eventos de mudança de clima por volta. Entre eventos, transição linear.
+  // Ex: [{lap:1, wetness:0}, {lap:20, wetness:0.7}, {lap:35, wetness:0.2}]
+  // = pista seca até L20, chuva chegando, secando depois
+  changes: WeatherChange[];
+  // Variabilidade da previsão: 0 = exato, 1 = totalmente incerto
+  // Aplicado como ruído nas voltas em que a chuva chega
+  uncertainty: number;
+}
+
+export interface WeatherChange {
+  lap: number;                 // volta em que atinge esse nível
+  wetness: number;             // 0..1
+}
+
+export interface WeatherState {
+  wetness: number;             // 0..1, estado atual da pista
+  rainIntensity: number;       // 0..1, intensidade ATUAL da chuva caindo
+}
+
+// --------- ESTADO DA CORRIDA ---------
+export interface RaceFlagState {
+  flag: 'green' | 'yellow' | 'safetyCar' | 'vsc' | 'red';
+  flagEndsAtLap: number | null;  // volta em que termina (null se não definida)
+  reason: string | null;
 }
 
 export interface RaceEntry {
@@ -131,6 +165,19 @@ export interface RaceEntry {
   startCompound: Compound;
   startEnergyMode: EnergyMode;
   pitStops: PitStop[];         // estratégia pré-definida; quando vazio, sem paradas
+  // Estratégia reativa: regras que podem disparar pit não planejado
+  reactiveStrategy?: ReactiveStrategy;
+}
+
+export interface ReactiveStrategy {
+  // Trocar pneus se chover acima desse nível e ainda estiver com slick
+  pitToIntermediateIfWetnessAbove?: number;  // ex: 0.4
+  // Trocar pra wet se acima desse nível
+  pitToWetIfWetnessAbove?: number;           // ex: 0.75
+  // Trocar pra slick se pista secar abaixo desse nível
+  pitToDryIfWetnessBelow?: number;           // ex: 0.25
+  // Pit oportunista durante safety car (ganha mais barato)
+  pitUnderSafetyCar?: boolean;
 }
 
 export interface PitStop {
